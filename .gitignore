@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+
+# Next.js and production output
+.next/
+out/
+build/
+
+# Local environment files — keep the safe example file tracked
+.env
+.env.*
+!.env.example
+!.env.test
+
+# Logs, diagnostics, and TypeScript build metadata
+*.log
+*.tsbuildinfo
+next-env.d.ts
+
+# Test and tooling output
+coverage/
+.turbo/
+
+# Hosting and local sandbox files
+.vercel/
+.snowflake/
+
+# Editor and operating-system files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
