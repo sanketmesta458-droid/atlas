@@ -410,18 +410,27 @@ export class GenerativeActionEngine {
       phases.push({
         name: `Aeroballistic 360° ${isBack ? "Backflip" : "Frontflip"}`,
         description:
-          "Tuck rotation around pitch axis with cushioned shockwave landing",
+          "Full-body aerial rotation with a tucked landing and shockwave",
         duration: 2.2,
         evaluate: (p) => {
           const apex = Math.sin(p * Math.PI);
           const spin = p * Math.PI * 2 * (isBack ? -1 : 1);
+          const tuck = Math.sin(p * Math.PI) * 1.25;
           return {
             jumpY: apex * 1.8,
-            torsoPitch: spin,
-            leftArmPitch: apex * 2.2,
-            rightArmPitch: apex * 2.2,
-            leftKnee: apex * 1.8,
-            rightKnee: apex * 1.8,
+            // Rotate the root group, not just the chest. This produces the
+            // visible full 360° backflip/frontflip that the command promises.
+            rootPitch: spin,
+            torsoPitch: -0.18 * apex,
+            headPitch: 0.12 * apex,
+            leftArmPitch: 0.45 + apex * 0.8,
+            rightArmPitch: 0.45 + apex * 0.8,
+            leftElbow: 0.65 + apex * 0.35,
+            rightElbow: 0.65 + apex * 0.35,
+            leftLegPitch: -0.32 * tuck,
+            rightLegPitch: -0.32 * tuck,
+            leftKnee: 0.12 + tuck,
+            rightKnee: 0.12 + tuck,
             squat: (1 - apex) * 0.4,
             shockwave: p > 0.8 ? (p - 0.8) / 0.2 : 0,
           };

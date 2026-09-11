@@ -113,6 +113,7 @@ function CameraDirector({
   robotPos,
   robotYaw,
   isCompanionBusy,
+  autoCameraEnabled,
   onIntroComplete,
   onIntroStage,
   skipIntro,
@@ -122,6 +123,7 @@ function CameraDirector({
   robotPos: [number, number, number];
   robotYaw: number;
   isCompanionBusy: boolean;
+  autoCameraEnabled: boolean;
   onIntroComplete: () => void;
   onIntroStage: (stage: number) => void;
   skipIntro: boolean;
@@ -129,7 +131,7 @@ function CameraDirector({
   const lastRobotPos = useRef<[number, number, number]>([...robotPos]);
   const lastRobotYaw = useRef(robotYaw);
   const hasEngagedChaseCamera = useRef(false);
-  const hasQueuedInitialChase = useRef(false);
+  const hasSeenFirstAction = useRef(false);
   const introStartedAt = useRef<number | null>(null);
   const introFinished = useRef(false);
   const tourPosition = useRef(new THREE.Vector3());
@@ -193,9 +195,10 @@ function CameraDirector({
       return;
     }
 
-    if (cameraView === "follow") {
-      // Preserve the opening frame through the first commanded action. Once the
-      // initial move or dance completes, switch cleanly into game-style follow.
+    if (autoCameraEnabled && cameraView === "follow") {
+      // Keep Atlas front-facing for the opening and the user's first action
+      // (normally the welcome dance). Only then ease around into the game-like
+      // over-the-shoulder view, rather than suddenly showing their back.
       const dx = robotPos[0] - lastRobotPos.current[0];
       const dz = robotPos[2] - lastRobotPos.current[2];
       const headingDelta = Math.abs(
@@ -213,21 +216,37 @@ function CameraDirector({
         robotPos[2] - forwardZ * 7.2,
       );
 
+      if (isCompanionBusy) hasSeenFirstAction.current = true;
+
       if (!hasEngagedChaseCamera.current) {
-        if (isCompanionBusy) hasQueuedInitialChase.current = true;
-
-        if (hasQueuedInitialChase.current && !isCompanionBusy) {
-          controls.target.copy(chaseTarget.current);
-          controls.object.position.copy(chasePosition.current);
+        if (!hasSeenFirstAction.current || isCompanionBusy) {
+          // Preserve the cinematic front view while the welcome action plays.
           controls.update();
-          hasEngagedChaseCamera.current = true;
+        } else {
+          // The first action has finished. Blend into the chase position over
+          // several frames so the transition feels intentional and cinematic.
+          const targetSmoothing = 1 - Math.exp(-5 * delta);
+          const cameraSmoothing = 1 - Math.exp(-2.2 * delta);
+          controls.target.lerp(chaseTarget.current, targetSmoothing);
+          controls.object.position.lerp(chasePosition.current, cameraSmoothing);
+          controls.update();
+          if (
+            controls.target.distanceTo(chaseTarget.current) < 0.04 &&
+            controls.object.position.distanceTo(chasePosition.current) < 0.08
+          ) {
+            hasEngagedChaseCamera.current = true;
+          }
         }
-      } else if (Math.abs(dx) > 0.0001 || Math.abs(dz) > 0.0001 || headingDelta > 0.0001) {
-
-        // Fast target tracking keeps the companion centered; the slightly slower
-        // camera movement creates the polished trailing motion of modern game cameras.
-        const targetSmoothing = 1 - Math.exp(-12 * delta);
-        const cameraSmoothing = 1 - Math.exp(-7 * delta);
+      } else if (
+        isCompanionBusy ||
+        Math.abs(dx) > 0.0001 ||
+        Math.abs(dz) > 0.0001 ||
+        headingDelta > 0.0001
+      ) {
+        // Track the character's center quickly, with a slightly delayed camera
+        // position for the smooth trailing feel used by third-person games.
+        const targetSmoothing = 1 - Math.exp(-14 * delta);
+        const cameraSmoothing = 1 - Math.exp(-5.5 * delta);
         controls.target.lerp(chaseTarget.current, targetSmoothing);
         controls.object.position.lerp(chasePosition.current, cameraSmoothing);
         controls.update();
@@ -331,6 +350,7 @@ export default function RobotStudio() {
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [audioMuted, setAudioMuted] = useState(false);
   const [cameraView, setCameraView] = useState<CameraView>("follow");
+  const [autoCameraEnabled, setAutoCameraEnabled] = useState(true);
   const [showCameraMenu, setShowCameraMenu] = useState(false);
   const [showLogDrawer, setShowLogDrawer] = useState(false);
   const [showCoachModal, setShowCoachModal] = useState(false);
@@ -349,8 +369,8 @@ export default function RobotStudio() {
   const [isIntroTour, setIsIntroTour] = useState(true);
   const [introStage, setIntroStage] = useState(0);
 
-  // Avatar Selection ("human" as default realistic stylish companion, "robot" as Tesla Optimus)
-  const [avatarType, setAvatarType] = useState<"human" | "robot">("human");
+  // Avatar Selection (Tesla Optimus is the default companion)
+  const [avatarType, setAvatarType] = useState<"human" | "robot">("robot");
 
   // Continuous Hands-Free Duplex Voice Conversation
   const [isContinuousVoice, setIsContinuousVoice] = useState(false);
@@ -555,7 +575,21 @@ export default function RobotStudio() {
       const text = (event as CustomEvent<string>).detail;
       if (text) phoneAudioBridge.send("speech", text);
     };
+    const showVoiceError = (event: Event) => {
+      const reason = (event as CustomEvent<string>).detail || "microphone unavailable";
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `voice-error-${Date.now()}`,
+          sender: "robot",
+          text: `Voice input needs microphone permission (${reason}). Allow the mic in Chrome, then tap the blue microphone again.`,
+          timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+          type: "chat",
+        },
+      ]);
+    };
     window.addEventListener("atlas-speech", relaySpeech);
+    window.addEventListener("atlas-voice-error", showVoiceError);
 
     storyEngine.setStoryListener((st) => {
       setStoryState(st);
@@ -577,6 +611,7 @@ export default function RobotStudio() {
       speechService.stopSpeaking();
       speechService.setContinuousMode(false);
       window.removeEventListener("atlas-speech", relaySpeech);
+      window.removeEventListener("atlas-voice-error", showVoiceError);
       phoneAudioBridge.onCommand(null);
       phoneAudioBridge.onRemoteStream(null);
       phoneAudioBridge.onStatus(null);
@@ -1159,6 +1194,19 @@ export default function RobotStudio() {
 
         {/* Topbar Right: Telemetry & Actions */}
         <div className="topbar-right">
+          <button
+            className={`apple-icon-btn ${autoCameraEnabled ? "active" : ""}`}
+            onClick={() => {
+              const next = !autoCameraEnabled;
+              setAutoCameraEnabled(next);
+              if (next) setCameraView("follow");
+            }}
+            title={autoCameraEnabled ? "Auto Camera: On (click to disable)" : "Auto Camera: Off (click to enable)"}
+            aria-label={autoCameraEnabled ? "Disable automatic camera" : "Enable automatic camera"}
+          >
+            <Camera size={15} />
+          </button>
+
           <div
             className="capsule heading-capsule"
             title="Live Character Heading and GPS Position"
@@ -1762,6 +1810,7 @@ export default function RobotStudio() {
             robotPos={status.pos}
             robotYaw={status.yaw}
             isCompanionBusy={status.isBusy}
+            autoCameraEnabled={autoCameraEnabled}
             onIntroComplete={() => setIsIntroTour(false)}
             onIntroStage={setIntroStage}
             skipIntro={!isIntroTour}

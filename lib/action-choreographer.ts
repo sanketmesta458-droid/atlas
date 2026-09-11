@@ -421,28 +421,9 @@ export function resolveObstacleCollision(
   if (!direct.hit) {
     return { pos: [targetX, currentPos[1], targetZ], blocked: false };
   }
-
-  // Tangential slide: Try moving along X only
-  const slideX = checkObstacleCollision(targetX, currentPos[2], robotRadius);
-  if (!slideX.hit) {
-    return {
-      pos: [targetX, currentPos[1], currentPos[2]],
-      blocked: true,
-      obstacle: direct.obstacle,
-    };
-  }
-
-  // Tangential slide: Try moving along Z only
-  const slideZ = checkObstacleCollision(currentPos[0], targetZ, robotRadius);
-  if (!slideZ.hit) {
-    return {
-      pos: [currentPos[0], currentPos[1], targetZ],
-      blocked: true,
-      obstacle: direct.obstacle,
-    };
-  }
-
-  // Completely obstructed: Halt safely in place to prevent entering water or colliding with trees
+  // Never slide along the obstacle. Sliding keeps the heading aimed into a
+  // wall and prevents the route planner from making progress. Callers replan
+  // from this exact safe position and then follow waypoint targets instead.
   return {
     pos: [currentPos[0], currentPos[1], currentPos[2]],
     blocked: true,
@@ -463,7 +444,10 @@ export function planObstacleReroute(
   type Node = { x: number; z: number; g: number; f: number };
   const key = (x: number, z: number) => `${x},${z}`;
   const toCell = (value: number) => Math.round(value / cell);
-  const clearCell = (x: number, z: number) => !checkObstacleCollision(x * cell, z * cell, 0.5).hit;
+  // Leave a generous clearance around trees, lake edges, and structures.
+  // This prevents a mathematically valid route from grazing an obstacle and
+  // triggering a replan loop at its corners.
+  const clearCell = (x: number, z: number) => !checkObstacleCollision(x * cell, z * cell, 0.68).hit;
   const nearestClear = (x: number, z: number) => {
     if (clearCell(x, z)) return [x, z] as const;
     for (let radius = 1; radius <= 8; radius++) {
@@ -514,13 +498,22 @@ export function planObstacleReroute(
     if (!previous) return [];
     cursor = previous;
   }
-  route.push([destination[0], destination[2]]);
+  // A command may point directly into a solid object. End at the nearest safe
+  // grid cell in that case, never at a point inside the obstacle.
+  route.push(
+    checkObstacleCollision(destination[0], destination[2], 0.68).hit
+      ? [goal[0] * cell, goal[1] * cell]
+      : [destination[0], destination[2]],
+  );
   return route;
 }
 
 export type RobotJointState = {
   worldPos: [number, number, number];
   yaw: number;
+  // Whole-character rotation for aerial acrobatics. Yaw remains the heading;
+  // pitch is used by flips so the body, rather than only the torso, rotates.
+  rootPitch: number;
   jumpY: number;
   squat: number;
   isSitting: boolean;
@@ -564,6 +557,7 @@ export type ActionStep = {
   ) => Partial<RobotJointState> & {
     worldPos: [number, number, number];
     yaw: number;
+    complete?: boolean;
   };
 };
 
@@ -575,6 +569,9 @@ export class ActionChoreographer {
 
   // Live 60FPS coordinates & heading
   private currentPos: [number, number, number] = [0, 0, 4.8];
+  // Origin of the latest outbound command, used for natural "come back" and
+  // "return to where you started" instructions.
+  private lastReturnPoint: [number, number, number] | null = null;
   private currentYaw: number = 0; // 0 rad = facing positive Z (Forward/South towards camera)
   private isSitting: boolean = false;
   // Held keyboard input is handled separately from scripted actions. This keeps
@@ -669,6 +666,19 @@ export class ActionChoreographer {
   } {
     // Normalize phrases like "go and sit", "walk and sit", "back and forth"
     let clean = commandText.toLowerCase().replace(/[,+]/g, " and ");
+    // Normalize common speech-recognition spellings before intent matching.
+    clean = clean
+      .replace(/\bback\s*(?:word|war|ward|wards)\b/g, "backward")
+      .replace(/\bfore\s*(?:word|ward|wards)\b/g, "forward")
+      .replace(/\bturn\s+write\b/g, "turn right")
+      .replace(/\bgo\s+write\b/g, "go right")
+      .replace(/\bturn\s+lift\b/g, "turn left")
+      .replace(/\bgo\s+lift\b/g, "go left")
+      .replace(/\bback\s+flip\b/g, "backflip")
+      .replace(/\b(?:dancing|dancer|dense|dens)\b/g, "dance")
+      .replace(/\b(?:ran|running|jog(?:ging)?|dash(?:ing)?|rush(?:ing)?|hurry(?:ing)?)\b/g, "sprint")
+      .replace(/\bspeed\s*up\b/g, "sprint")
+      .replace(/\b(?:go|walk|move|step)\s+fast\b/g, "sprint forward");
     clean = clean.replace(/\b(?:go|walk|head|run)\s+and\s+sit\b/g, "sit");
     clean = clean.replace(/\bback\s+and\s+forth\b/g, "back_and_forth");
 
@@ -679,6 +689,8 @@ export class ActionChoreographer {
 
     const steps: ActionStep[] = [];
     let detectedPlan: GenerativeActionPlan | undefined;
+    const commandOrigin: [number, number, number] = [...this.currentPos];
+    let hasOutboundMove = false;
 
     for (const part of parts) {
       // 1. SITTING. "sit" means sit where the companion is now; only an
@@ -761,10 +773,54 @@ export class ActionChoreographer {
         continue;
       }
 
-      // 4b. FORWARD STRIDE IN CURRENT HEADING ("move", "walk forward", "forward", "walk", "step forward", "advance")
+      // 4b. SIDE-STEP / TURN. Keep this before the generic forward rule so
+      // short voice commands such as just "left" or "right" never fall into
+      // the generative-action engine.
+      if (/\b(?:left|right)\b/.test(part)) {
+        const numMatch = part.match(/(\d+)/);
+        const isLeft = part.includes("left");
+        if (/\b(?:turn|rotate|face|spin|pivot)\b/.test(part)) {
+          const degrees = numMatch
+            ? Math.max(15, Math.min(360, parseInt(numMatch[1], 10)))
+            : 90;
+          steps.push(this.createTurnStep(degrees, isLeft));
+        } else {
+          const count = numMatch
+            ? Math.max(1, Math.min(15, parseInt(numMatch[1], 10)))
+            : 4;
+          steps.push(this.createStrafeStep(count, isLeft));
+        }
+        continue;
+      }
+
+      // "Go 5 steps forward and come back to where you started" returns to
+      // the command origin. A later standalone "come back" returns to the
+      // start point saved by the most recent outbound command.
+      if (
+        /\breturn\b/.test(part) ||
+        /\bback\s+to\s+(?:the\s+)?(?:start|starting|place|position)\b/.test(part) ||
+        /\bcome back\b/.test(part) && /\b(?:start|started|place|position|where|again)\b/.test(part)
+      ) {
+        const returnPoint = hasOutboundMove
+          ? commandOrigin
+          : this.lastReturnPoint ?? commandOrigin;
+        steps.push(this.createNavigateToLandmarkStep("fountain", false, returnPoint, "Return to Start"));
+        continue;
+      }
+
+      // Dance is intentionally routed through a fixed known-good dance plan,
+      // including common speech-to-text variants normalized above.
+      if (/\b(?:dance|groove|moonwalk|shuffle|salsa|disco|boogie)\b/.test(part)) {
+        const plan = generativeEngine.compile(part.includes("dance") ? part : "dance hip hop");
+        detectedPlan = plan;
+        for (const phase of plan.phases) steps.push(this.createGenerativeKinematicStep(phase));
+        continue;
+      }
+
+      // 4c. FORWARD STRIDE IN CURRENT HEADING ("go", "move", "walk forward", "forward", "walk", "step forward", "advance")
       // Maintains whichever direction the robot was turned (e.g. turned left, turned right)!
       if (
-        /\b(?:move|walk forward|step forward|forward|walk|advance|step|run|sprint)\b/.test(
+        /\b(?:go|move|walk forward|step forward|forward|walk|advance|step|run|sprint)\b/.test(
           part,
         ) &&
         !part.includes("back") &&
@@ -782,6 +838,7 @@ export class ActionChoreographer {
 
         // Stride FORWARD along robot's CURRENT body yaw heading!
         steps.push(this.createTranslateSteps(count, 1, isRunning, false));
+        hasOutboundMove = true;
         continue;
       }
 
@@ -795,25 +852,7 @@ export class ActionChoreographer {
         continue;
       }
 
-      // 6. STRAFE (LEFT / RIGHT)
-      if (
-        /\b(?:left|right)\b/.test(part) &&
-        (part.includes("go") ||
-          part.includes("step") ||
-          part.includes("walk") ||
-          part.includes("move") ||
-          part.includes("strafe"))
-      ) {
-        let count = 4;
-        const numMatch = part.match(/(\d+)/);
-        if (numMatch)
-          count = Math.max(1, Math.min(15, parseInt(numMatch[1], 10)));
-        const isLeft = part.includes("left");
-        steps.push(this.createStrafeStep(count, isLeft));
-        continue;
-      }
-
-      // 7. ROTATE / TURN (90 deg, 180 deg, turn left, turn right)
+      // 6. ROTATE / TURN (90 deg, 180 deg, turn left, turn right)
       if (
         /\b(?:turn|rotate|face|spin|pivot)\b/.test(part) &&
         !part.includes("hand") &&
@@ -831,7 +870,7 @@ export class ActionChoreographer {
         continue;
       }
 
-      // 8. COMPILE VIA UNIVERSAL GENERATIVE KINEMATIC ENGINE!
+      // 7. COMPILE VIA UNIVERSAL GENERATIVE KINEMATIC ENGINE!
       // This handles ANY arbitrary custom command (martial arts kicks, backflips, salutes, bows, pushups,
       // yoga, squats, stealth crouch, shivers, head scratches, superman flying, dancing, breakdancing, etc.)
       const plan = generativeEngine.compile(part);
@@ -846,6 +885,8 @@ export class ActionChoreographer {
       // Default: Walk 6 steps forward toward camera
       steps.push(this.createTranslateSteps(6, 1, false, true));
     }
+
+    if (hasOutboundMove) this.lastReturnPoint = commandOrigin;
 
     this.queue = steps;
     this.currentStepIndex = 0;
@@ -871,7 +912,12 @@ export class ActionChoreographer {
     const strideLength = isRunning ? 0.65 : 0.48; // meters per step
     const totalDistance = stepCount * strideLength * direction;
     const speed = isRunning ? 2.1 : 1.15; // meters per second
-    const duration = Math.abs(totalDistance) / speed;
+    // Normal walks complete from distance, while this generous upper bound
+    // gives the re-route planner enough time to travel around an obstacle.
+    const duration = Math.abs(totalDistance) / speed + 12;
+    let destination: [number, number, number] | null = null;
+    let reroute: [number, number][] = [];
+    let rerouteIndex = 0;
 
     return {
       id: `walk-${stepCount}-${direction}`,
@@ -880,47 +926,96 @@ export class ActionChoreographer {
         : `Walking Forward (${(stepCount * strideLength).toFixed(1)}m)`,
       description: `Physical continuous coordinate displacement at 60FPS`,
       duration,
-      update: (dt, p, pos, yaw, elapsed) => {
+      update: (dt, _p, pos, yaw, elapsed) => {
         const currentHeading = faceUser ? 0 : yaw;
-        const distThisFrame = speed * dt * direction;
-        const targetX = pos[0] + Math.sin(currentHeading) * distThisFrame;
-        const targetZ = pos[2] + Math.cos(currentHeading) * distThisFrame;
+        if (!destination) {
+          destination = [
+            pos[0] + Math.sin(currentHeading) * totalDistance,
+            pos[1],
+            pos[2] + Math.cos(currentHeading) * totalDistance,
+          ];
+        }
 
-        // Obstacle avoidance safety barrier (blocks water, trees, fountain, boundaries)
-        const res = resolveObstacleCollision(pos, targetX, targetZ);
+        // Follow planned safe waypoints after a collision. The direct target
+        // remains the final destination, so Atlas exits the detour and keeps
+        // walking rather than standing still or sliding along the obstacle.
+        let waypoint = reroute[rerouteIndex] ?? [destination[0], destination[2]];
+        let distanceToWaypoint = Math.hypot(waypoint[0] - pos[0], waypoint[1] - pos[2]);
+        while (reroute.length && distanceToWaypoint < 0.18 && rerouteIndex < reroute.length - 1) {
+          rerouteIndex += 1;
+          waypoint = reroute[rerouteIndex];
+          distanceToWaypoint = Math.hypot(waypoint[0] - pos[0], waypoint[1] - pos[2]);
+        }
+        const routeHeading = Math.atan2(waypoint[0] - pos[0], waypoint[1] - pos[2]);
+        const movingAlongRoute = reroute.length > 0;
+        const heading = movingAlongRoute ? routeHeading : currentHeading;
+        const moveDistance = Math.min(distanceToWaypoint, speed * dt);
+        const targetX = pos[0] + Math.sin(heading) * moveDistance;
+        const targetZ = pos[2] + Math.cos(heading) * moveDistance;
+        let res = resolveObstacleCollision(pos, targetX, targetZ);
         if (res.blocked && res.obstacle) {
           this.triggerObstacleAlert(res.obstacle.name);
+          const plannedRoute = planObstacleReroute(pos, destination);
+          if (plannedRoute.length) {
+            reroute = plannedRoute;
+            rerouteIndex = 0;
+            const safeDestination = plannedRoute[plannedRoute.length - 1];
+            destination = [safeDestination[0], pos[1], safeDestination[1]];
+            waypoint = reroute[0];
+            const rerouteHeading = Math.atan2(waypoint[0] - pos[0], waypoint[1] - pos[2]);
+            const rerouteDistance = Math.hypot(waypoint[0] - pos[0], waypoint[1] - pos[2]);
+            res = resolveObstacleCollision(
+              pos,
+              pos[0] + Math.sin(rerouteHeading) * Math.min(rerouteDistance, speed * dt),
+              pos[2] + Math.cos(rerouteHeading) * Math.min(rerouteDistance, speed * dt),
+            );
+          }
         } else if (!res.blocked && this.lastObstacleAlert) {
           this.clearObstacleAlert();
         }
 
         // Natural kinematic stride angles
-        const strideSpeed = isRunning ? 15 : 10;
-        const legCycle =
-          Math.sin(elapsed * strideSpeed) * (isRunning ? 0.75 : 0.55);
-        const armCycle = -legCycle * 0.8;
-        const bob = Math.abs(Math.sin(elapsed * strideSpeed)) * 0.04;
+        // A restrained, asymmetric gait reads much more naturally than a
+        // simple large sine wave. The swinging leg flexes at the knee while
+        // the planted leg stays almost straight, avoiding the "marching" look.
+        const strideSpeed = isRunning ? 13.5 : 11.5;
+        // Reverse the stride phase for backward travel so the feet visibly
+        // step backward rather than appearing to moonwalk forward.
+        const legCycle = Math.sin(elapsed * strideSpeed) * (isRunning ? 0.56 : 0.38) * direction;
+        const leftKneeFlex = Math.max(0, -legCycle) * (isRunning ? 1.22 : 1.08);
+        const rightKneeFlex = Math.max(0, legCycle) * (isRunning ? 1.22 : 1.08);
+        const armCycle = -legCycle * (isRunning ? 0.72 : 0.64);
+        const bob = (1 - Math.cos(elapsed * strideSpeed * 2)) * (isRunning ? 0.014 : 0.009);
 
         return {
           worldPos: res.pos,
-          yaw: currentHeading,
+          yaw: res.blocked ? currentHeading : (reroute.length ? Math.atan2(waypoint[0] - pos[0], waypoint[1] - pos[2]) : currentHeading),
           isSitting: false,
           currentAction: res.blocked
-            ? `Obstacle Guard: ${res.obstacle?.name || "Solid Barrier"}`
+            ? reroute.length
+              ? `Rerouting around ${res.obstacle?.name || "obstacle"}`
+              : `Obstacle Guard: ${res.obstacle?.name || "Solid Barrier"}`
+            : reroute.length
+              ? "Following safe reroute"
             : isRunning
-              ? "Running"
-              : "Walking",
+              ? direction < 0 ? "Running Backward" : "Running"
+              : direction < 0 ? "Walking Backward" : "Walking",
           jumpY: bob,
-          torsoPitch: isRunning ? 0.12 : 0.05,
-          torsoRoll: Math.sin(elapsed * strideSpeed * 0.5) * 0.03,
+          torsoPitch: isRunning ? 0.075 : 0.025,
+          torsoRoll: Math.sin(elapsed * strideSpeed) * (isRunning ? 0.022 : 0.014),
+          torsoYaw: Math.sin(elapsed * strideSpeed) * (isRunning ? 0.035 : 0.02),
           leftLegPitch: legCycle,
           rightLegPitch: -legCycle,
-          leftKnee: Math.max(0, -legCycle * 0.9),
-          rightKnee: Math.max(0, legCycle * 0.9),
+          leftKnee: 0.045 + leftKneeFlex,
+          rightKnee: 0.045 + rightKneeFlex,
           leftArmPitch: armCycle,
           rightArmPitch: -armCycle,
-          leftElbow: 0.4 + Math.abs(armCycle) * 0.35,
-          rightElbow: 0.4 + Math.abs(armCycle) * 0.35,
+          leftElbow: 0.16 + Math.abs(armCycle) * 0.22,
+          rightElbow: 0.16 + Math.abs(armCycle) * 0.22,
+          complete:
+            !res.blocked &&
+            rerouteIndex >= reroute.length - 1 &&
+            Math.hypot(destination[0] - res.pos[0], destination[2] - res.pos[2]) < 0.18,
         };
       },
     };
@@ -948,7 +1043,7 @@ export class ActionChoreographer {
           this.clearObstacleAlert();
         }
 
-        const legCycle = Math.sin(elapsed * 9) * 0.4;
+        const legCycle = Math.sin(elapsed * 10.5) * 0.28;
         return {
           worldPos: res.pos,
           yaw,
@@ -959,8 +1054,8 @@ export class ActionChoreographer {
           torsoRoll: isLeft ? -0.06 : 0.06,
           leftLegPitch: legCycle,
           rightLegPitch: -legCycle,
-          leftKnee: Math.max(0, legCycle),
-          rightKnee: Math.max(0, -legCycle),
+          leftKnee: 0.05 + Math.max(0, -legCycle) * 1.05,
+          rightKnee: 0.05 + Math.max(0, legCycle) * 1.05,
         };
       },
     };
@@ -1027,9 +1122,11 @@ export class ActionChoreographer {
   private createNavigateToLandmarkStep(
     landmarkKey: keyof typeof PARK_LANDMARKS,
     sitOnArrival = false,
+    destinationOverride?: [number, number, number],
+    nameOverride?: string,
   ): ActionStep {
-    const landmark = PARK_LANDMARKS[landmarkKey];
-    const target = PARK_APPROACH_POINTS[landmarkKey];
+    const landmark = destinationOverride ?? PARK_LANDMARKS[landmarkKey];
+    const target = destinationOverride ?? PARK_APPROACH_POINTS[landmarkKey];
     const speed = 2.0;
     const tx = target[0];
     const tz = target[2];
@@ -1045,9 +1142,9 @@ export class ActionChoreographer {
 
     return {
       id: `nav-${landmarkKey}`,
-      name: sitOnArrival
+      name: nameOverride ?? (sitOnArrival
         ? "Walk to Bench & Sit Down"
-        : `Walk to ${landmarkKey}`,
+        : `Walk to ${landmarkKey}`),
       description: `Navigating directly toward ${landmarkKey}`,
       duration,
       update: (dt, p, pos, yaw, elapsed) => {
@@ -1061,7 +1158,13 @@ export class ActionChoreographer {
 
         if (dist > 0.45 && !isArrived) {
           const targetYaw = Math.atan2(dx, dz);
-          const nextYaw = yaw + (targetYaw - yaw) * Math.min(1, dt * 5.5);
+          // Turn by the shortest angular arc. Without angle wrapping, a
+          // waypoint crossing -π/π can make Atlas spin in place at an obstacle.
+          const yawDelta = Math.atan2(
+            Math.sin(targetYaw - yaw),
+            Math.cos(targetYaw - yaw),
+          );
+          const nextYaw = yaw + yawDelta * Math.min(1, dt * 5.5);
           const moveStep = Math.min(dist, speed * dt);
           const targetX = pos[0] + Math.sin(nextYaw) * moveStep;
           const targetZ = pos[2] + Math.cos(nextYaw) * moveStep;
@@ -1075,9 +1178,10 @@ export class ActionChoreographer {
             this.clearObstacleAlert();
           }
 
-          const legCycle = Math.sin(elapsed * 10) * 0.55;
-          const armCycle = -legCycle * 0.75;
-          const bob = Math.abs(Math.sin(elapsed * 10)) * 0.04;
+          const strideSpeed = 11.5;
+          const legCycle = Math.sin(elapsed * strideSpeed) * 0.38;
+          const armCycle = -legCycle * 0.64;
+          const bob = (1 - Math.cos(elapsed * strideSpeed * 2)) * 0.009;
 
           return {
             worldPos: res.pos,
@@ -1089,12 +1193,15 @@ export class ActionChoreographer {
             jumpY: bob,
             leftLegPitch: legCycle,
             rightLegPitch: -legCycle,
-            leftKnee: Math.max(0, -legCycle * 0.9),
-            rightKnee: Math.max(0, legCycle * 0.9),
+            torsoPitch: 0.025,
+            torsoRoll: Math.sin(elapsed * strideSpeed) * 0.014,
+            torsoYaw: Math.sin(elapsed * strideSpeed) * 0.02,
+            leftKnee: 0.045 + Math.max(0, -legCycle) * 1.08,
+            rightKnee: 0.045 + Math.max(0, legCycle) * 1.08,
             leftArmPitch: armCycle,
             rightArmPitch: -armCycle,
-            leftElbow: 0.4 + Math.abs(armCycle) * 0.3,
-            rightElbow: 0.4 + Math.abs(armCycle) * 0.3,
+            leftElbow: 0.16 + Math.abs(armCycle) * 0.22,
+            rightElbow: 0.16 + Math.abs(armCycle) * 0.22,
           };
         } else if (reroute.length && rerouteIndex < reroute.length - 1) {
           rerouteIndex += 1;
@@ -1215,6 +1322,7 @@ export class ActionChoreographer {
     const defaultState: RobotJointState = {
       worldPos: this.currentPos,
       yaw: this.currentYaw,
+      rootPitch: 0,
       jumpY: 0,
       squat: 0,
       isSitting: this.isSitting,
@@ -1255,15 +1363,20 @@ export class ActionChoreographer {
       this.currentPos = safePos.pos;
       if (safePos.blocked && safePos.obstacle) this.triggerObstacleAlert(safePos.obstacle.name);
       else this.clearObstacleAlert();
-      const stride = forwardAxis ? Math.sin(now / 1000 * (this.manualInput.sprint ? 15 : 10)) * (this.manualInput.sprint ? 0.75 : 0.55) : 0;
+      const strideSpeed = this.manualInput.sprint ? 13.5 : 11.5;
+      const stride = forwardAxis ? Math.sin(now / 1000 * strideSpeed) * (this.manualInput.sprint ? 0.56 : 0.38) : 0;
       this.currentActionName = forwardAxis ? (this.manualInput.sprint ? "Sprinting" : "Walking") : "Turning";
       this.notifyStatus(this.currentActionName, false);
       return {
         ...defaultState, worldPos: this.currentPos, yaw: this.currentYaw, isSitting: false,
-        currentAction: this.currentActionName, torsoPitch: forwardAxis ? (this.manualInput.sprint ? 0.12 : 0.05) : 0,
-        torsoRoll: turnAxis * -0.05, leftLegPitch: stride, rightLegPitch: -stride,
-        leftKnee: Math.max(0, -stride * 0.9), rightKnee: Math.max(0, stride * 0.9),
-        leftArmPitch: -stride * 0.8, rightArmPitch: stride * 0.8,
+        currentAction: this.currentActionName, torsoPitch: forwardAxis ? (this.manualInput.sprint ? 0.075 : 0.025) : 0,
+        torsoRoll: forwardAxis ? Math.sin(now / 1000 * strideSpeed) * (this.manualInput.sprint ? 0.022 : 0.014) : turnAxis * -0.04,
+        torsoYaw: forwardAxis ? Math.sin(now / 1000 * strideSpeed) * (this.manualInput.sprint ? 0.035 : 0.02) : 0,
+        leftLegPitch: stride, rightLegPitch: -stride,
+        leftKnee: 0.045 + Math.max(0, -stride) * (this.manualInput.sprint ? 1.22 : 1.08),
+        rightKnee: 0.045 + Math.max(0, stride) * (this.manualInput.sprint ? 1.22 : 1.08),
+        leftArmPitch: -stride * (this.manualInput.sprint ? 0.72 : 0.64), rightArmPitch: stride * (this.manualInput.sprint ? 0.72 : 0.64),
+        leftElbow: 0.16 + Math.abs(stride) * 0.15, rightElbow: 0.16 + Math.abs(stride) * 0.15,
       };
     }
 
@@ -1310,7 +1423,7 @@ export class ActionChoreographer {
     // Periodic telemetry update for UI radar & HUD
     this.notifyStatus(this.currentActionName, false);
 
-    if (progress >= 1) {
+    if (progress >= 1 || computed.complete) {
       this.currentStepIndex++;
       this.stepStartTime = now;
 

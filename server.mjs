@@ -24,4 +24,12 @@ io.on("connection", (socket) => {
   });
 });
 
-server.listen(port, hostname, () => console.log(`Atlas + audio signaling listening on http://${hostname}:${port}`));
+server.listen(port, hostname, () => {
+  // 0.0.0.0 means "listen on every network interface". It is valid for the
+  // server, but it is not an address users should open in a browser.
+  const localUrl = `http://localhost:${port}`;
+  console.log(`Atlas frontend ready: ${localUrl}`);
+  if (hostname === "0.0.0.0") {
+    console.log("Network access is enabled for phone pairing on port " + port + ".");
+  }
+});

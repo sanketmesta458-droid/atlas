@@ -23,6 +23,8 @@ export const TeslaOptimusModel = React.memo(function TeslaOptimusModel() {
   const leftKneeRef = useRef<THREE.Group>(null);
   const rightHipRef = useRef<THREE.Group>(null);
   const rightKneeRef = useRef<THREE.Group>(null);
+  const leftFootRef = useRef<THREE.Group>(null);
+  const rightFootRef = useRef<THREE.Group>(null);
   const torsoRef = useRef<THREE.Group>(null);
 
   const [lipData, setLipData] = useState<LipSyncData>({
@@ -55,7 +57,7 @@ export const TeslaOptimusModel = React.memo(function TeslaOptimusModel() {
           (jointState.squat || 0) * 0.45,
         jointState.worldPos[2],
       );
-      rootRef.current.rotation.y = jointState.yaw;
+      rootRef.current.rotation.set(jointState.rootPitch, jointState.yaw, 0);
     }
 
     // Dynamic Visor Waveform / Mouth Light
@@ -233,6 +235,14 @@ export const TeslaOptimusModel = React.memo(function TeslaOptimusModel() {
           delta,
         );
       }
+      if (leftFootRef.current) {
+        leftFootRef.current.rotation.x = THREE.MathUtils.damp(
+          leftFootRef.current.rotation.x,
+          -jointState.leftLegPitch * 0.48 - jointState.leftKnee * 0.18,
+          20,
+          delta,
+        );
+      }
 
       // Right Leg & Knee
       if (rightHipRef.current) {
@@ -248,6 +258,14 @@ export const TeslaOptimusModel = React.memo(function TeslaOptimusModel() {
         rightKneeRef.current.rotation.x = THREE.MathUtils.damp(
           rightKneeRef.current.rotation.x,
           jointState.rightKnee + squatKnee,
+          20,
+          delta,
+        );
+      }
+      if (rightFootRef.current) {
+        rightFootRef.current.rotation.x = THREE.MathUtils.damp(
+          rightFootRef.current.rotation.x,
+          -jointState.rightLegPitch * 0.48 - jointState.rightKnee * 0.18,
           20,
           delta,
         );
@@ -476,7 +494,7 @@ export const TeslaOptimusModel = React.memo(function TeslaOptimusModel() {
                   {pearlWhiteArmor}
                 </mesh>
                 {/* Boot & Forward Toes */}
-                <group position={[0, -0.24, 0.08]}>
+                <group ref={leftFootRef} position={[0, -0.24, 0.08]}>
                   <RoundedBox args={[0.16, 0.1, 0.34]} radius={0.03} castShadow>
                     {darkCarbonCore}
                   </RoundedBox>
@@ -506,7 +524,7 @@ export const TeslaOptimusModel = React.memo(function TeslaOptimusModel() {
                   {pearlWhiteArmor}
                 </mesh>
                 {/* Boot & Forward Toes */}
-                <group position={[0, -0.24, 0.08]}>
+                <group ref={rightFootRef} position={[0, -0.24, 0.08]}>
                   <RoundedBox args={[0.16, 0.1, 0.34]} radius={0.03} castShadow>
                     {darkCarbonCore}
                   </RoundedBox>

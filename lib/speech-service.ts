@@ -451,8 +451,16 @@ class OpenSourceSpeechService {
 
     try {
       this.recognition = new SpeechRec();
-      this.recognition.lang = "en-US";
-      this.recognition.continuous = true;
+      // Keep command recognition in English. en-IN is preserved for Indian
+      // English accents, while a non-English browser locale must not make
+      // English commands such as "go backward" silently fail.
+      this.recognition.lang = navigator.language?.toLowerCase().startsWith("en")
+        ? navigator.language
+        : "en-US";
+      // A tap is one command, so finish promptly after its first final phrase.
+      // Hands-free mode remains continuous and is restarted when Chromium ends
+      // a recognition session.
+      this.recognition.continuous = this.continuousMode;
       this.recognition.interimResults = true;
       this.recognition.maxAlternatives = 1;
 
@@ -513,6 +521,13 @@ class OpenSourceSpeechService {
           onInterimResult?.(displayCandidate);
           resetSilenceTimer();
         }
+
+        // Waiting for a silence timeout made tap-to-talk feel unreliable on
+        // phones: some browsers end immediately after a final result. Commit
+        // that result now; continuous mode still waits for a natural pause.
+        if (finalChunk && !this.continuousMode) {
+          this.commitSpeechResult();
+        }
       };
 
       this.recognition.onerror = (err: any) => {
@@ -534,6 +549,9 @@ class OpenSourceSpeechService {
             // service errors. Stop and surface the cause to the UI.
             this.lastListeningError = error || "unknown";
             this.continuousMode = false;
+            window.dispatchEvent(
+              new CustomEvent("atlas-voice-error", { detail: this.lastListeningError }),
+            );
           } else {
             this.restartContinuousListening();
           }

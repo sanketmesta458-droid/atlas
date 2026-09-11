@@ -10,7 +10,7 @@ const GEMINI_MAX_OUTPUT_TOKENS = 180;
 
 // Deliberately compact: it is sent on each turn and describes only what Gemini
 // needs to converse naturally and operate the on-screen companion.
-const ATLAS_SYSTEM_PROMPT = `You are Atlas, a friendly 3D companion in Grand Cyber Park. Explain only real app features: 3D human/Optimus avatar, chat, browser voice and hands-free mode, speech/lip-sync, keyboard/on-screen movement, camera angle pad, music-reactive dancing, dance lessons, and story quests. You control one avatar. Park: plaza, fountain, gazebo, lake pier, sakura grove, pine grove, gym, bench. Controls: walk/run/sprint, turn, jump, backflip, dance, wave, salute, bow, pushups, karate, yoga, sit/stand, or navigate to a listed place. Return ONLY compact JSON: {"speech":"1-2 short sentences","actions":["0-2 supported actions"],"mood":"happy|energetic|calm|curious|mischievous","camera":"follow|closeup|overview"}. Never invent controls, APIs, or unsafe real-world actions. Preserve an explicit sprint/run/walk direction rather than replacing it with dance.`;
+const ATLAS_SYSTEM_PROMPT = `You are Atlas, a friendly 3D companion in Grand Cyber Park. Explain only real app features: 3D human/Optimus avatar, chat, browser voice and hands-free mode, speech/lip-sync, keyboard/on-screen movement, camera angle pad, music-reactive dancing, dance lessons, and story quests. You control one avatar. Park destinations are only: Grand Marble Fountain, Cedar Gazebo Pavilion, Lakeside Pier, Sakura Cherry Grove, Pine Grove, Calisthenics Gym, Willow Stream Bridge, and Garden Bench. Controls: go/walk/run/sprint forward or backward, go left/right, turn, jump, backflip, dance, wave, salute, bow, pushups, karate, yoga, sit/stand, or navigate to a listed place. Treat a noisy voice transcription as its closest supported command: ran/jog/rush/dash means sprint; back word means backward; foreword means forward; write/lift after turn means right/left. For any misspelled, partial, or phonetic park-place request, infer the closest destination above and return its exact supported action (for example "walk to the water fountain", "walk to the gazebo", "walk to the lake pier", "walk to the cherry blossom tree", "walk to the pine grove", "walk to the workout station", "walk to the willow stream", or "go and sit on the bench"). Return ONLY compact JSON: {"speech":"1-2 short sentences","actions":["0-2 supported actions"],"mood":"happy|energetic|calm|curious|mischievous","camera":"follow|closeup|overview"}. Never invent controls, APIs, or unsafe real-world actions. Preserve an explicit sprint/run/walk direction rather than replacing it with dance.`;
 
 type AICharacterRequest = {
   prompt: string;
@@ -43,7 +43,10 @@ export async function POST(req: Request) {
     // Exact locomotion remains deterministic so Gemini cannot ever turn a
     // "sprint" request into a dance. Gemini controls the rest of the avatar's
     // supported movement vocabulary and all richer conversation.
-    if (isDirectLocomotionCommand(prompt)) {
+    // Unknown "go to ..." phrases are deliberately offered to Gemini first
+    // so it can correct noisy microphone spelling into one of the real map
+    // destinations instead of treating the phrase as plain forward movement.
+    if (isDirectLocomotionCommand(prompt) && !isDestinationCorrectionRequest(prompt)) {
       return NextResponse.json({
         source: "local_semantic_brain",
         ...synthesizeLocalAIResponse(prompt, avatarType, nearbyLandmark),
@@ -152,7 +155,7 @@ function isCamera(value: unknown): value is "follow" | "closeup" | "overview" {
 }
 
 function isDirectLocomotionCommand(prompt: string) {
-  return /\b(?:walk|move|step|run|sprint|back|reverse|left|right|turn|rotate)\b/i.test(
+  return /\b(?:go|walk|move|step|run|sprint|forward|back|backward|reverse|left|right|turn|rotate|jump|hop)\b/i.test(
     prompt,
   );
 }
@@ -170,8 +173,33 @@ function synthesizeLocalAIResponse(
   let mood = "friendly";
   let camera: "follow" | "closeup" | "overview" = "follow";
 
+  // Directional commands are deliberately local and deterministic. This is
+  // shared by typed, phone, and browser-microphone input, so short phrases
+  // such as "go", "right", and "jump" always perform an action.
+  if (!isParkNavigationRequest(p) && /\b(?:jump|hop)\b/.test(p)) {
+    actions.push("jump");
+    speech = "Jumping now.";
+    mood = "energetic";
+  } else if (!isParkNavigationRequest(p) && /\b(?:left|right)\b/.test(p)) {
+    const steps = getRequestedSteps(p);
+    const direction = p.includes("left") ? "left" : "right";
+    if (/\b(?:turn|rotate|face|spin|pivot)\b/.test(p)) {
+      actions.push(`turn ${direction} ${getRequestedDegrees(p)} degrees`);
+      speech = `Turning ${direction}.`;
+    } else {
+      actions.push(`go ${direction} ${steps} steps`);
+      speech = `Moving ${direction} ${steps} steps.`;
+    }
+  } else if (!isParkNavigationRequest(p) && /\b(?:go|walk|move|step|come|run|sprint|forward|back|backward|reverse)\b/.test(p)) {
+    const steps = getRequestedSteps(p);
+    const isSprint = /\b(?:sprint|fast|run)\b/.test(p);
+    const isBackward = /\b(?:back|backward|reverse)\b/.test(p);
+    actions.push(isBackward ? `step back ${steps} steps` : `walk forward ${steps} steps ${isSprint ? "sprint" : ""}`.trim());
+    speech = isBackward ? `Stepping back ${steps} paces.` : `Moving forward ${steps} steps${isSprint ? " at a sprint" : ""}.`;
+  }
+
   // Intent: Stunts & Gymnastics
-  if (p.includes("backflip") || p.includes("flip") || p.includes("superhero")) {
+  else if (p.includes("backflip") || p.includes("flip") || p.includes("superhero")) {
     actions.push("backflip and superhero landing");
     speech =
       avatarType === "human"
@@ -308,4 +336,23 @@ function synthesizeLocalAIResponse(
   }
 
   return { speech, actions, mood, camera };
+}
+
+function isDestinationCorrectionRequest(prompt: string) {
+  return /\b(?:go|walk|move|head|take me|bring me|navigate|travel)\b/i.test(prompt) &&
+    /\b(?:to|toward|near|at)\b/i.test(prompt);
+}
+
+function getRequestedSteps(prompt: string) {
+  const match = prompt.match(/\b(\d+)\b/);
+  return match ? Math.min(12, Math.max(1, parseInt(match[1], 10))) : 4;
+}
+
+function getRequestedDegrees(prompt: string) {
+  const match = prompt.match(/\b(\d+)\b/);
+  return match ? Math.min(360, Math.max(15, parseInt(match[1], 10))) : 90;
+}
+
+function isParkNavigationRequest(prompt: string) {
+  return /\b(?:fountain|gazebo|pavilion|lake|pier|dock|cherry|sakura|blossom|pine|grove|bench|gym|workout|stream|bridge)\b/.test(prompt);
 }
